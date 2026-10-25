@@ -252,8 +252,11 @@ class AngleReader(threading.Thread):
                 except ValueError:
                     continue
                 with self.lock:
-                    self.angle = float(d[CFG.get("axis", "a")])
-                    self.other = float(d.get("b", 0.0))
+                    # axis 决定用哪个轴当主轴(比如模块 X 轴平行转轴时用 "b"),
+                    # other 显示"另一个轴", 便于判断安装方向
+                    ax = CFG.get("axis", "a")
+                    self.angle = float(d[ax])
+                    self.other = float(d.get("b" if ax == "a" else "a", 0.0))
                 n += 1
                 now = time.time()
                 if now - t0 >= 1:
@@ -473,11 +476,19 @@ class GlassGLWidget(QOpenGLWidget):
         self.angle_open = float(CFG["angle_open"])
         self.glass_start = float(CFG.get("glass_start", 0.05))
         self.refresh_hz = float(CFG.get("refresh_hz", 3))
+        # 按需显示: 浓度 ≤ visible_eps 时把窗口 hide() 掉, 同时停掉抓屏与重绘。
+        # hidden_refresh_hz=0 表示收起期间完全不抓屏(桌面回到原生帧率)。
+        self.visible_eps = float(CFG.get("visible_eps", 0.005))
+        self.hidden_refresh_hz = float(CFG.get("hidden_refresh_hz", 0))
+        self._ever_shown = False
         self.max_tilt = float(CFG.get("max_tilt_deg", 88.0)) * 3.14159265 / 180.0
         self.eye_h = float(CFG.get("eye_dist_h", 2.0))       # 眼距 = 屏高倍数
         self.spread = float(CFG.get("blur_spread", 0.55))
         self.dark = float(CFG.get("darkening", 0.001))
         self.max_taps = int(CFG.get("max_taps", 32))
+        # 周期性重申"置顶"的频率 (Hz): 任务栏也是 topmost, 点它会压到我们上面(见 tick)
+        self.keep_on_top_hz = float(CFG.get("keep_on_top_hz", 2))
+        self._last_topmost = 0.0
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -500,20 +511,28 @@ class GlassGLWidget(QOpenGLWidget):
         self.setWindowTitle("duo-glass")
 
     def showEvent(self, _ev):
+        self._ever_shown = True
         # 关键: 把自己从屏幕捕获中排除, 否则截图会抓到上一次的渲染结果,
         # 反馈几帧后收敛成一片纯色 ("白屏" 的根因之一)
         # --smoke 调试时设 _no_exclude=True, 便于抓屏验证渲染效果
-        if getattr(self, "_no_exclude", False):
-            return
-        try:
-            WDA_EXCLUDEFROMCAPTURE = 0x11
-            r = ctypes.windll.user32.SetWindowDisplayAffinity(int(self.winId()),
-                                                              WDA_EXCLUDEFROMCAPTURE)
-            if not r:
-                print("[警告] SetWindowDisplayAffinity 失败, 截图可能包含自身")
-        except Exception as e:  # noqa
-            print("[警告] 显示排除设置异常:", e)
+        if not getattr(self, "_no_exclude", False):
+            try:
+                WDA_EXCLUDEFROMCAPTURE = 0x11
+                r = ctypes.windll.user32.SetWindowDisplayAffinity(int(self.winId()),
+                                                                  WDA_EXCLUDEFROMCAPTURE)
+                if not r:
+                    print("[警告] SetWindowDisplayAffinity 失败, 截图可能包含自身")
+            except Exception as e:  # noqa
+                print("[警告] 显示排除设置异常:", e)
 
+        # 主循环定时器只建一次: 按需显示会反复 hide()/show(), 每次 showEvent
+        # 都新建一个 QTimer 会让 tick 被重复调用(旧定时器并不会自己停)。
+        self.start_tick()
+
+    def start_tick(self):
+        """启动主循环定时器。收起状态下也必须跑, 否则没人把窗口叫回来。"""
+        if hasattr(self, "timer"):
+            return
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(16)
@@ -625,6 +644,19 @@ class GlassGLWidget(QOpenGLWidget):
         GL.glDrawArrays(GL.GL_TRIANGLE_FAN, 0, 4)
         GL.glBindVertexArray(0)
 
+    def _fresh_frame(self):
+        """补抓一帧并等它到位(最多 0.25s), 让玻璃出现时显示的就是当下的画面。
+        收起期间不抓屏, 最后一帧可能已经很旧; 抓屏异常时也不会卡住不出现。"""
+        cur = self.capturer.latest()
+        seq0 = cur[3] if cur else -1
+        self.capturer.kick()
+        t0 = time.time()
+        while time.time() - t0 < 0.25:
+            f = self.capturer.latest()
+            if f and f[3] != seq0:
+                return
+            self.capturer.done.wait(timeout=0.02)
+
     # ---------- 主循环 ----------
     def tick(self):
         if self.manual is not None:
@@ -649,15 +681,37 @@ class GlassGLWidget(QOpenGLWidget):
             mode = "手动"
         self.g += (target - self.g) * 0.22
 
-        # Overlay 常驻显示: 不再按浓度隐藏 (透明逻辑已按需求移除)
-        if not self.shown:
-            self.capturer.kick()
+        # ---- 按需显示: 浓度 ≈ 0 时收起玻璃, 并停掉抓屏与重绘 ----
+        # 常显时桌面永远是一张按 refresh_hz 回放的截图(拖动/滚动都不跟手, 而且抓屏
+        # 的 CPU 一直付着)。收起后桌面回到原生帧率, 只在开合过渡时才出现玻璃。
+        if self.g <= self.visible_eps:
+            if self.shown:
+                self.shown = False
+                self.hide()                 # 窗口不可见 -> paintGL 不再被触发
+            if self.hidden_refresh_hz > 0:  # 默认 0 = 收起期间完全不抓屏
+                now = time.time()
+                if now - self._last_kick >= 1.0 / self.hidden_refresh_hz:
+                    self._last_kick = now
+                    self.capturer.kick()
         else:
+            if not self.shown:
+                # 先补抓一帧"新的"截图, 避免抬起瞬间看到收起之前的旧画面
+                self._fresh_frame()
+                self.show()
+                self.shown = True
+                self._last_kick = time.time()
             now = time.time()
             if self.refresh_hz > 0 and now - self._last_kick >= 1.0 / self.refresh_hz:
                 self._last_kick = now
                 self.capturer.kick()
             self.update()
+            # 任务栏 (Shell_TrayWnd) 自己也带 WS_EX_TOPMOST。一旦你真实点击任务栏,
+            # 资源管理器就会把它插到"置顶带"的最前面, 压到本窗口之上, 于是玻璃盖不住
+            # 任务栏(任务栏不再跟着玻璃一起变)。而 WindowStaysOnTopHint 只在创建窗口
+            # 时声明一次, 之后 Qt 不会自动重申, 所以要周期性地重新置顶。
+            if self.keep_on_top_hz > 0 and now - self._last_topmost >= 1.0 / self.keep_on_top_hz:
+                self._last_topmost = now
+                self.raise_()          # 对 topmost 窗口 = 移到置顶带最前, 且不抢焦点
             if CFG.get("lock_at_close") and self.g > 0.985 and not self._locked:
                 self._locked = True
                 import ctypes
@@ -668,13 +722,14 @@ class GlassGLWidget(QOpenGLWidget):
         # 控制台实时单行重绘
         if time.time() - self._last_print > 0.1:
             self._last_print = time.time()
+            tag = "" if self.shown else " [收起]"
             if self.reader is not None:
                 a = angle if angle is not None else float("nan")
                 print(f"\r[{mode}] a={a:7.2f}° b={(other if other is not None else 0):7.2f}° "
-                      f"浓度={self.g*100:5.1f}%  [{status} {fps:3.0f}Hz] "
+                      f"浓度={self.g*100:5.1f}%{tag}  [{status} {fps:3.0f}Hz] "
                       f"↑↓调节 r=切自动 Esc退出 ", end="", flush=True)
             else:
-                print(f"\r[{mode}] 玻璃={self.g*100:5.1f}%  "
+                print(f"\r[{mode}] 玻璃={self.g*100:5.1f}%{tag}  "
                       f"[↑↓调节 ←清空 →拉满 r=切自动 Esc退出] ", end="", flush=True)
 
 
@@ -741,7 +796,8 @@ def main():
         else:
             print(f"  串口: {port_cfg} @{baud}")
     print("-" * 60)
-    print("  默认=正常显示(浓度0)。先点一下本控制台窗口再按键!")
+    print(f"  按需显示: 浓度 ≤ {CFG.get('visible_eps', 0.005)*100:.1f}% 时收起玻璃(停止抓屏/重绘)")
+    print("  默认=浓度0(桌面原生帧率, 不显示玻璃)。先点一下本控制台窗口再按键!")
     print("  ↑/↓ 调浓度   ← 清空   → 拉满   r 切换角度自动跟随   Esc 退出")
     print("=" * 60)
 
@@ -765,7 +821,7 @@ def main():
     widget = GlassGLWidget(screen, reader, capturer,
                            manual=HoldControl(g_smoke) if smoke else kb)
 
-    print("[运行] Overlay 常驻显示。Ctrl+C 退出。")
+    print("[运行] 按需显示: 浓度为 0 时玻璃收起(桌面原生帧率), 抬起才出现。Ctrl+C 退出。")
 
     if smoke:
         def dump_and_quit():
@@ -806,18 +862,29 @@ def main():
         widget.shown = True
         capturer.kick()
     else:
-        widget.show()
-        widget.shown = True
-        capturer.kick()
+        # 按需显示: 启动时浓度 = 0, 先不显示窗口(桌面保持原生帧率)。
+        # 主循环定时器要在这里就启动 —— 收起状态下没人 show(), 得靠 tick 把它叫回来。
+        widget.shown = False
+        widget.start_tick()
 
-    # 着色器没链上就别留着全屏黑屏窗口让人莫名其妙
+    # 着色器没链上就别留着全屏黑屏窗口让人莫名其妙。
+    # 注意: 按需显示下窗口可能一直没显示过(_gl_linked 还没机会生成), 必须等到
+    # 第一次 show() 之后再判定, 否则会误判成"驱动不支持"直接退出。
     if not smoke:
-        def check_gl():
-            if not getattr(widget, "_gl_linked", False):
+        gl_watch = QTimer()
+        gl_watch.setInterval(300)
+
+        def watch_gl():
+            if getattr(widget, "_gl_linked", False):
+                gl_watch.stop()
+                return
+            if getattr(widget, "_gl_ready", False):
+                gl_watch.stop()
                 print("\n[致命] 着色器未链接, 无法渲染。请更新显卡驱动。")
                 app.exit(2)
 
-        QTimer.singleShot(1500, check_gl)
+        gl_watch.timeout.connect(watch_gl)
+        gl_watch.start()
 
     rc = app.exec()
     return rc if isinstance(rc, int) else 0
